@@ -7,7 +7,8 @@
 
   <description>
     ROS 2 control hardware interface for Robot 2 using
-    an Arduino Uno, L298 motor drivers, and encoder feedback.
+    an Arduino Mega, two L298N motor drivers, and four
+    independent encoder feedback channels (one per wheel).
   </description>
 
   <maintainer email="kabirud080@gmail.com">
