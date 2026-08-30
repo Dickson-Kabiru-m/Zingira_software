@@ -2,10 +2,10 @@
 <robot xmlns:xacro="http://ros.org">
 
   <!--
-    Select Gazebo simulation hardware vs the real Arduino/L298 robot.
-    Defaults to sim (false = not real) to preserve existing behaviour
-    for anyone launching without passing this explicitly - forwarded
-    from robot_state_publisher.launch.py via xacro mappings.
+    Select Gazebo simulation hardware vs the real Arduino/L298N
+    robot. Defaults to sim (false = not real) to preserve existing
+    behaviour for anyone launching without passing this explicitly -
+    forwarded from robot_state_publisher.launch.py via xacro mappings.
   -->
   <xacro:arg name="sim_mode" default="false"/>
 
@@ -61,8 +61,15 @@
 
 
   <!-- ====================================================== -->
-  <!-- REAL ROBOT (Arduino Uno + 2x L298N + quadrature enc.)   -->
+  <!-- REAL ROBOT (Arduino Mega + 2x L298N + 4x quadrature enc.) -->
   <!-- ====================================================== -->
+  <!--
+    Unlike the Uno build, front and back motors on each side now
+    sit on separate L298N channels with their own encoder, so
+    each of the 4 joints below maps to a genuinely independent
+    wheel on the firmware side (ZingiraFirmware) - there is no
+    more front/rear averaging in robot_2_hardware/Robot2System.
+  -->
 
   <xacro:unless value="$(arg sim_mode)">
 
@@ -72,7 +79,7 @@
         <plugin>robot_2_hardware/Robot2System</plugin>
 
         <!-- Arduino serial configuration -->
-        <param name="device">/dev/ttyUSB_ARDUINO</param>
+        <param name="device">/dev/ttyUSB_MEGA</param>
         <param name="baud_rate">57600</param>
         <param name="timeout_ms">100</param>
 
@@ -81,45 +88,64 @@
 
         <!--
           Arduino PID period, in SECONDS. on_init() reads a parameter
-          named exactly "pid_period" (see getNumericParameter calls in
-          robot_2_system.cpp) - NOT "pid_period_ms". 0.05s = 50ms,
-          matching the firmware's config.h PID_PERIOD.
+          named exactly "pid_period" - NOT "pid_period_ms". 0.05s =
+          50ms, matching ZingiraFirmware's config.h PID_PERIOD.
         -->
         <param name="pid_period">0.05</param>
 
         <!-- Wheel geometry -->
         <param name="wheel_radius">0.0425</param>
 
+        <!--
+          Per-wheel direction correction. Each wheel now has its
+          own motor channel and its own encoder, so each can be
+          independently wired backwards - a single left/right sign
+          pair (as on the Uno build) is no longer enough. Leave at
+          1.0 until you've confirmed a given wheel's motor or
+          encoder direction is actually reversed, then flip that
+          one wheel's relevant sign to -1.0.
+        -->
+        <param name="front_left_encoder_sign">1.0</param>
+        <param name="front_right_encoder_sign">1.0</param>
+        <param name="back_left_encoder_sign">1.0</param>
+        <param name="back_right_encoder_sign">1.0</param>
+
+        <param name="front_left_command_sign">1.0</param>
+        <param name="front_right_command_sign">1.0</param>
+        <param name="back_left_command_sign">1.0</param>
+        <param name="back_right_command_sign">1.0</param>
+
       </hardware>
 
       <!--
-        Joint order below MUST match the index assumption hard-coded
-        in Robot2System::write()/read():
+        Joint order below MUST match the wheel order hard-coded in
+        both ZingiraFirmware (config.h WheelIndex enum) and
+        Robot2System::read()/write():
           0 = front_left, 1 = front_right, 2 = back_left, 3 = back_right
       -->
 
-      <!-- LEFT FRONT (index 0) -->
+      <!-- FRONT LEFT (index 0) -->
       <joint name="front_left_wheel_joint">
         <command_interface name="velocity"/>
         <state_interface name="position"/>
         <state_interface name="velocity"/>
       </joint>
 
-      <!-- RIGHT FRONT (index 1) -->
+      <!-- FRONT RIGHT (index 1) -->
       <joint name="front_right_wheel_joint">
         <command_interface name="velocity"/>
         <state_interface name="position"/>
         <state_interface name="velocity"/>
       </joint>
 
-      <!-- LEFT REAR (index 2) -->
+      <!-- BACK LEFT (index 2) -->
       <joint name="back_left_wheel_joint">
         <command_interface name="velocity"/>
         <state_interface name="position"/>
         <state_interface name="velocity"/>
       </joint>
 
-      <!-- RIGHT REAR (index 3) -->
+      <!-- BACK RIGHT (index 3) -->
       <joint name="back_right_wheel_joint">
         <command_interface name="velocity"/>
         <state_interface name="position"/>
