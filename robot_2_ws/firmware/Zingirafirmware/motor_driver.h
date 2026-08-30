@@ -34,3 +34,19 @@ void setWheelMotor(int wheel, int pwm);
  ******* GND SHARING *******
  Arduino GND + both L298N motor driver GNDs + all 4 encoder GNDs
 */
+
+/*
+FL encoder A / B	  2 (int) / 22
+FR encoder A / B	  3 (int) / 24
+BL encoder A / B	  18 (int) / 26
+BR encoder A / B	  19 (int) / 28
+
+Left board: ENA(FL) / IN1 / IN2	    5 (PWM) / 30 / 31
+Left board: ENB(BL) / IN3 / IN4	    6 (PWM) / 32 / 33
+Right board: ENA(FR) / IN1 / IN2	  7 (PWM) / 34 / 35
+Right board: ENB(BR) / IN3 / IN4	  8 (PWM) / 36 / 37
+
+Servo	  9 (PWM)
+
+MPU6050 SDA / SCL	  20 / 21
+*/
