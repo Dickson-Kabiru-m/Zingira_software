@@ -7,8 +7,10 @@
     base_class_type="hardware_interface::SystemInterface">
 
     <description>
-      Hardware interface for Robot 2 using an Arduino Uno,
-      L298 motor drivers, and two quadrature encoder feedback channels.
+      Hardware interface for Robot 2 using an Arduino Mega,
+      two L298N motor drivers (one per side, each with two
+      independent channels), and four independent quadrature
+      encoder feedback channels - one per wheel.
     </description>
 
   </class>
