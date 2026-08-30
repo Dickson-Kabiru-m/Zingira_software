@@ -1,6 +1,7 @@
 #include "robot_2_hardware/robot_2_system.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -34,10 +35,11 @@ hardware_interface::CallbackReturn Robot2System::on_init(
   // Validate number of joints
   // ----------------------------------------------------------
 
-  if (info_.joints.size() != 4) {
+  if (info_.joints.size() != kNumWheels) {
     RCLCPP_ERROR(
       rclcpp::get_logger("robot_2_hardware"),
-      "Expected exactly 4 wheel joints, got %zu",
+      "Expected exactly %zu wheel joints, got %zu",
+      kNumWheels,
       info_.joints.size());
 
     return hardware_interface::CallbackReturn::ERROR;
@@ -104,9 +106,9 @@ hardware_interface::CallbackReturn Robot2System::on_init(
   // Allocate storage
   // ----------------------------------------------------------
 
-  hw_commands_.assign(info_.joints.size(), 0.0);
-  hw_positions_.assign(info_.joints.size(), 0.0);
-  hw_velocities_.assign(info_.joints.size(), 0.0);
+  hw_commands_.assign(kNumWheels, 0.0);
+  hw_positions_.assign(kNumWheels, 0.0);
+  hw_velocities_.assign(kNumWheels, 0.0);
 
   // ----------------------------------------------------------
   // Hardware parameters
@@ -146,39 +148,33 @@ hardware_interface::CallbackReturn Robot2System::on_init(
       "wheel_separation",
       0.30);
 
-  left_encoder_sign_ =
-    getNumericParameter(
-      "left_encoder_sign",
-      1.0);
+  // ----------------------------------------------------------
+  // Per-wheel direction correction parameters.
+  // Index order matches joint_names_: 0=FL, 1=FR, 2=BL, 3=BR.
+  // ----------------------------------------------------------
 
-  right_encoder_sign_ =
-    getNumericParameter(
-      "right_encoder_sign",
-      1.0);
+  encoder_sign_[0] = getNumericParameter("front_left_encoder_sign", 1.0);
+  encoder_sign_[1] = getNumericParameter("front_right_encoder_sign", 1.0);
+  encoder_sign_[2] = getNumericParameter("back_left_encoder_sign", 1.0);
+  encoder_sign_[3] = getNumericParameter("back_right_encoder_sign", 1.0);
 
-  left_command_sign_ =
-    getNumericParameter(
-      "left_command_sign",
-      1.0);
-
-  right_command_sign_ =
-    getNumericParameter(
-      "right_command_sign",
-      1.0);
+  command_sign_[0] = getNumericParameter("front_left_command_sign", 1.0);
+  command_sign_[1] = getNumericParameter("front_right_command_sign", 1.0);
+  command_sign_[2] = getNumericParameter("back_left_command_sign", 1.0);
+  command_sign_[3] = getNumericParameter("back_right_command_sign", 1.0);
 
   // ----------------------------------------------------------
   // Initial state
   // ----------------------------------------------------------
 
-  previous_left_ticks_ = 0;
-  previous_right_ticks_ = 0;
+  previous_ticks_.fill(0);
 
   first_read_ = true;
   active_ = false;
 
   RCLCPP_INFO(
     rclcpp::get_logger("robot_2_hardware"),
-    "Robot 2 hardware interface initialized");
+    "Robot 2 hardware interface initialized (4 independent wheels)");
 
   RCLCPP_INFO(
     rclcpp::get_logger("robot_2_hardware"),
@@ -231,8 +227,7 @@ hardware_interface::CallbackReturn Robot2System::on_configure(
       "Could not send encoder reset command");
   }
 
-  previous_left_ticks_ = 0;
-  previous_right_ticks_ = 0;
+  previous_ticks_.fill(0);
   first_read_ = true;
 
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -257,23 +252,11 @@ hardware_interface::CallbackReturn Robot2System::on_activate(
       "Failed to send stop command during activation");
   }
 
-  std::fill(
-    hw_commands_.begin(),
-    hw_commands_.end(),
-    0.0);
+  std::fill(hw_commands_.begin(), hw_commands_.end(), 0.0);
+  std::fill(hw_positions_.begin(), hw_positions_.end(), 0.0);
+  std::fill(hw_velocities_.begin(), hw_velocities_.end(), 0.0);
 
-  std::fill(
-    hw_positions_.begin(),
-    hw_positions_.end(),
-    0.0);
-
-  std::fill(
-    hw_velocities_.begin(),
-    hw_velocities_.end(),
-    0.0);
-
-  previous_left_ticks_ = 0;
-  previous_right_ticks_ = 0;
+  previous_ticks_.fill(0);
   first_read_ = true;
 
   active_ = true;
@@ -308,8 +291,7 @@ hardware_interface::CallbackReturn Robot2System::on_deactivate(
 std::vector<hardware_interface::StateInterface>
 Robot2System::export_state_interfaces()
 {
-  std::vector<hardware_interface::StateInterface>
-    state_interfaces;
+  std::vector<hardware_interface::StateInterface> state_interfaces;
 
   for (std::size_t i = 0; i < joint_names_.size(); ++i) {
 
@@ -335,8 +317,7 @@ Robot2System::export_state_interfaces()
 std::vector<hardware_interface::CommandInterface>
 Robot2System::export_command_interfaces()
 {
-  std::vector<hardware_interface::CommandInterface>
-    command_interfaces;
+  std::vector<hardware_interface::CommandInterface> command_interfaces;
 
   for (std::size_t i = 0; i < joint_names_.size(); ++i) {
 
@@ -353,17 +334,12 @@ Robot2System::export_command_interfaces()
 // ============================================================
 // READ
 //
-// Arduino command:
+// Arduino command:  "e\n"
+// Arduino response: "t_fl t_fr t_bl t_br\n"
 //
-// e
-//
-// Arduino response:
-//
-// left_ticks right_ticks
-//
-// The Arduino returns cumulative encoder counts.
-// We calculate the delta between reads and convert it
-// into wheel position and velocity.
+// Each wheel now has its own encoder, so positions/velocities
+// are computed independently per wheel - no more duplicating
+// one side's reading across its front and back joint.
 // ============================================================
 
 hardware_interface::return_type Robot2System::read(
@@ -374,10 +350,9 @@ hardware_interface::return_type Robot2System::read(
     return hardware_interface::return_type::ERROR;
   }
 
-  long left_ticks = 0;
-  long right_ticks = 0;
+  std::array<long, kNumWheels> ticks{};
 
-  if (!requestEncoders(left_ticks, right_ticks)) {
+  if (!requestEncoders(ticks)) {
 
     RCLCPP_ERROR(
       rclcpp::get_logger("robot_2_hardware"),
@@ -386,80 +361,33 @@ hardware_interface::return_type Robot2System::read(
     return hardware_interface::return_type::ERROR;
   }
 
-  // ----------------------------------------------------------
-  // Convert cumulative ticks to wheel positions
-  // ----------------------------------------------------------
+  const double period_seconds = period.seconds();
 
-  const double left_position =
-    ticksToRadians(
-      static_cast<double>(left_ticks) *
-      left_encoder_sign_);
+  for (std::size_t i = 0; i < kNumWheels; ++i) {
 
-  const double right_position =
-    ticksToRadians(
-      static_cast<double>(right_ticks) *
-      right_encoder_sign_);
+    const double signed_ticks =
+      static_cast<double>(ticks[i]) * encoder_sign_[i];
 
-  // ----------------------------------------------------------
-  // Calculate velocity
-  // ----------------------------------------------------------
+    hw_positions_[i] = ticksToRadians(signed_ticks);
 
-  const double period_seconds =
-    period.seconds();
+    if (first_read_) {
 
-  if (first_read_) {
+      hw_velocities_[i] = 0.0;
 
-    hw_velocities_[0] = 0.0;
-    hw_velocities_[1] = 0.0;
-    hw_velocities_[2] = 0.0;
-    hw_velocities_[3] = 0.0;
+    } else if (period_seconds > 0.0) {
 
-    first_read_ = false;
-
-  } else if (period_seconds > 0.0) {
-
-    const long delta_left =
-      left_ticks - previous_left_ticks_;
-
-    const long delta_right =
-      right_ticks - previous_right_ticks_;
-
-    const double left_velocity =
-      ticksPerSecondToRadiansPerSecond(
+      const long delta =
         static_cast<long>(
-          delta_left * left_encoder_sign_),
-        period_seconds);
+          (ticks[i] - previous_ticks_[i]) * encoder_sign_[i]);
 
-    const double right_velocity =
-      ticksPerSecondToRadiansPerSecond(
-        static_cast<long>(
-          delta_right * right_encoder_sign_),
-        period_seconds);
+      hw_velocities_[i] =
+        ticksPerSecondToRadiansPerSecond(delta, period_seconds);
+    }
 
-    // Both front and rear joints represent the same side
-    hw_velocities_[0] = left_velocity;
-    hw_velocities_[2] = left_velocity;
-
-    hw_velocities_[1] = right_velocity;
-    hw_velocities_[3] = right_velocity;
+    previous_ticks_[i] = ticks[i];
   }
 
-  // ----------------------------------------------------------
-  // Both joints on each side share the same encoder
-  // ----------------------------------------------------------
-
-  hw_positions_[0] = left_position;
-  hw_positions_[2] = left_position;
-
-  hw_positions_[1] = right_position;
-  hw_positions_[3] = right_position;
-
-  // ----------------------------------------------------------
-  // Save encoder counts
-  // ----------------------------------------------------------
-
-  previous_left_ticks_ = left_ticks;
-  previous_right_ticks_ = right_ticks;
+  first_read_ = false;
 
   return hardware_interface::return_type::OK;
 }
@@ -468,22 +396,12 @@ hardware_interface::return_type Robot2System::read(
 // ============================================================
 // WRITE
 //
-// ros2_control gives wheel angular velocities in rad/s.
+// ros2_control gives wheel angular velocities in rad/s, one per
+// independent wheel. No more averaging front/rear per side -
+// each wheel gets its own command sign correction and its own
+// ticks-per-period value sent straight to the firmware.
 //
-// Arduino firmware expects target encoder ticks per PID
-// period.
-//
-// Therefore:
-//
-// rad/s
-//   ↓
-// rad / PID period
-//   ↓
-// revolutions / PID period
-//   ↓
-// encoder ticks / PID period
-//
-// The Arduino PID controller then controls PWM.
+// rad/s -> rad/PID-period -> rev/PID-period -> ticks/PID-period
 // ============================================================
 
 hardware_interface::return_type Robot2System::write(
@@ -494,52 +412,15 @@ hardware_interface::return_type Robot2System::write(
     return hardware_interface::return_type::ERROR;
   }
 
-  // ----------------------------------------------------------
-  // Average front/rear commands for each side
-  // ----------------------------------------------------------
+  std::array<double, kNumWheels> ticks_per_period{};
 
-  const double left_velocity =
-    (
-      hw_commands_[0] +
-      hw_commands_[2]
-    ) / 2.0;
+  for (std::size_t i = 0; i < kNumWheels; ++i) {
 
-  const double right_velocity =
-    (
-      hw_commands_[1] +
-      hw_commands_[3]
-    ) / 2.0;
+    const double corrected = hw_commands_[i] * command_sign_[i];
+    ticks_per_period[i] = velocityToTicksPerPeriod(corrected);
+  }
 
-  // ----------------------------------------------------------
-  // Apply command direction corrections
-  // ----------------------------------------------------------
-
-  const double corrected_left =
-    left_velocity * left_command_sign_;
-
-  const double corrected_right =
-    right_velocity * right_command_sign_;
-
-  // ----------------------------------------------------------
-  // Convert rad/s to encoder ticks per PID period
-  // ----------------------------------------------------------
-
-  const double left_ticks =
-    velocityToTicksPerPeriod(
-      corrected_left);
-
-  const double right_ticks =
-    velocityToTicksPerPeriod(
-      corrected_right);
-
-  // ----------------------------------------------------------
-  // Send command
-  // ----------------------------------------------------------
-
-  if (!sendMotorCommand(
-      left_ticks,
-      right_ticks))
-  {
+  if (!sendMotorCommand(ticks_per_period)) {
     RCLCPP_ERROR(
       rclcpp::get_logger("robot_2_hardware"),
       "Failed to send motor command");
@@ -587,9 +468,7 @@ bool Robot2System::openSerial()
   usleep(2000000);
 
   // Flush stale data
-  tcflush(
-    serial_fd_,
-    TCIOFLUSH);
+  tcflush(serial_fd_, TCIOFLUSH);
 
   RCLCPP_INFO(
     rclcpp::get_logger("robot_2_hardware"),
@@ -668,38 +547,18 @@ bool Robot2System::configureSerial()
       return false;
   }
 
-  cfsetispeed(
-    &tty,
-    speed);
+  cfsetispeed(&tty, speed);
+  cfsetospeed(&tty, speed);
 
-  cfsetospeed(
-    &tty,
-    speed);
+  tty.c_cflag |= (CLOCAL | CREAD);
+  tty.c_cflag &= ~CSTOPB;
+  tty.c_cflag &= ~CRTSCTS;
+  tty.c_cflag &= ~PARENB;
+  tty.c_cflag &= ~CSIZE;
+  tty.c_cflag |= CS8;
 
-  tty.c_cflag |=
-    (CLOCAL | CREAD);
+  if (tcsetattr(serial_fd_, TCSANOW, &tty) != 0) {
 
-  tty.c_cflag &=
-    ~CSTOPB;
-
-  tty.c_cflag &=
-    ~CRTSCTS;
-
-  tty.c_cflag &=
-    ~PARENB;
-
-  tty.c_cflag &=
-    ~CSIZE;
-
-  tty.c_cflag |=
-    CS8;
-
-  if (
-    tcsetattr(
-      serial_fd_,
-      TCSANOW,
-      &tty) != 0)
-  {
     RCLCPP_ERROR(
       rclcpp::get_logger("robot_2_hardware"),
       "tcsetattr failed: %s",
@@ -723,26 +582,16 @@ bool Robot2System::writeSerial(
     return false;
   }
 
-  const char * data =
-    command.c_str();
-
-  std::size_t remaining =
-    command.size();
+  const char * data = command.c_str();
+  std::size_t remaining = command.size();
 
   while (remaining > 0) {
 
-    const ssize_t result =
-      ::write(
-        serial_fd_,
-        data,
-        remaining);
+    const ssize_t result = ::write(serial_fd_, data, remaining);
 
     if (result < 0) {
 
-      if (
-        errno == EAGAIN ||
-        errno == EWOULDBLOCK)
-      {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
         continue;
       }
 
@@ -755,8 +604,7 @@ bool Robot2System::writeSerial(
     }
 
     data += result;
-    remaining -=
-      static_cast<std::size_t>(result);
+    remaining -= static_cast<std::size_t>(result);
   }
 
   return true;
@@ -777,37 +625,28 @@ bool Robot2System::readLine(
     return false;
   }
 
-  const auto start =
-    std::chrono::steady_clock::now();
+  const auto start = std::chrono::steady_clock::now();
 
   while (true) {
 
-    const auto now =
-      std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
 
     const auto elapsed =
-      std::chrono::duration_cast<
-        std::chrono::milliseconds>(
-          now - start).count();
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - start).count();
 
     if (elapsed >= timeout_ms) {
       return false;
     }
 
-    const int remaining_timeout =
-      timeout_ms -
-      static_cast<int>(elapsed);
+    const int remaining_timeout = timeout_ms - static_cast<int>(elapsed);
 
     struct pollfd pfd {};
 
     pfd.fd = serial_fd_;
     pfd.events = POLLIN;
 
-    const int result =
-      poll(
-        &pfd,
-        1,
-        remaining_timeout);
+    const int result = poll(&pfd, 1, remaining_timeout);
 
     if (result < 0) {
 
@@ -826,11 +665,7 @@ bool Robot2System::readLine(
 
       char buffer[64];
 
-      const ssize_t bytes =
-        ::read(
-          serial_fd_,
-          buffer,
-          sizeof(buffer));
+      const ssize_t bytes = ::read(serial_fd_, buffer, sizeof(buffer));
 
       if (bytes <= 0) {
         continue;
@@ -838,8 +673,7 @@ bool Robot2System::readLine(
 
       for (ssize_t i = 0; i < bytes; ++i) {
 
-        const char c =
-          buffer[i];
+        const char c = buffer[i];
 
         if (c == '\n' || c == '\r') {
 
@@ -863,11 +697,12 @@ bool Robot2System::readLine(
 
 // ============================================================
 // REQUEST ENCODERS
+//
+// Expects a response line: "t_fl t_fr t_bl t_br"
 // ============================================================
 
 bool Robot2System::requestEncoders(
-  long & left_ticks,
-  long & right_ticks)
+  std::array<long, kNumWheels> & ticks)
 {
   if (!writeSerial("e\n")) {
 
@@ -880,10 +715,7 @@ bool Robot2System::requestEncoders(
 
   std::string line;
 
-  if (!readLine(
-      line,
-      timeout_ms_))
-  {
+  if (!readLine(line, timeout_ms_)) {
     RCLCPP_ERROR(
       rclcpp::get_logger("robot_2_hardware"),
       "Timed out waiting for encoder data");
@@ -893,7 +725,7 @@ bool Robot2System::requestEncoders(
 
   std::stringstream ss(line);
 
-  if (!(ss >> left_ticks >> right_ticks)) {
+  if (!(ss >> ticks[0] >> ticks[1] >> ticks[2] >> ticks[3])) {
 
     RCLCPP_ERROR(
       rclcpp::get_logger("robot_2_hardware"),
@@ -910,80 +742,56 @@ bool Robot2System::requestEncoders(
 // ============================================================
 // SEND MOTOR COMMAND
 //
-// Arduino expects:
-//
-// m <left ticks/period> <right ticks/period>
-//
+// Arduino expects: "m t_fl t_fr t_bl t_br\n"
 // ============================================================
 
 bool Robot2System::sendMotorCommand(
-  double left_velocity,
-  double right_velocity)
+  const std::array<double, kNumWheels> & ticks_per_period)
 {
   std::ostringstream command;
 
-  command.setf(
-    std::ios::fixed);
-
+  command.setf(std::ios::fixed);
   command.precision(4);
 
-  command
-    << "m "
-    << left_velocity
-    << " "
-    << right_velocity
-    << "\n";
+  command << "m";
 
-  return writeSerial(
-    command.str());
+  for (std::size_t i = 0; i < kNumWheels; ++i) {
+    command << " " << ticks_per_period[i];
+  }
+
+  command << "\n";
+
+  return writeSerial(command.str());
 }
 
 
 // ============================================================
-// VELOCITY → TICKS / PID PERIOD
+// VELOCITY -> TICKS / PID PERIOD
 // ============================================================
 
 double Robot2System::velocityToTicksPerPeriod(
   double velocity) const
 {
-  const double radians_per_period =
-    velocity *
-    pid_period_seconds_;
+  const double radians_per_period = velocity * pid_period_seconds_;
+  const double revolutions_per_period = radians_per_period / (2.0 * M_PI);
 
-  const double revolutions_per_period =
-    radians_per_period /
-    (2.0 * M_PI);
-
-  return
-    revolutions_per_period *
-    encoder_ticks_per_rev_;
+  return revolutions_per_period * encoder_ticks_per_rev_;
 }
 
 
 // ============================================================
-// TICKS → RADIANS
+// TICKS -> RADIANS
 // ============================================================
-
-double Robot2System::ticksToRadians(
-  long ticks) const
-{
-  return ticksToRadians(
-    static_cast<double>(ticks));
-}
-
 
 double Robot2System::ticksToRadians(
   double ticks) const
 {
-  return
-    ticks *
-    (2.0 * M_PI) /
-    encoder_ticks_per_rev_;
+  return ticks * (2.0 * M_PI) / encoder_ticks_per_rev_;
 }
 
 
 // ============================================================
-// TICKS / SECOND → RAD / SECOND
+// TICKS / SECOND -> RAD / SECOND
 // ============================================================
 
 double Robot2System::ticksPerSecondToRadiansPerSecond(
@@ -995,13 +803,9 @@ double Robot2System::ticksPerSecondToRadiansPerSecond(
   }
 
   const double ticks_per_second =
-    static_cast<double>(delta_ticks) /
-    period_seconds;
+    static_cast<double>(delta_ticks) / period_seconds;
 
-  return
-    ticks_per_second *
-    (2.0 * M_PI) /
-    encoder_ticks_per_rev_;
+  return ticks_per_second * (2.0 * M_PI) / encoder_ticks_per_rev_;
 }
 
 
@@ -1013,8 +817,7 @@ double Robot2System::getNumericParameter(
   const std::string & name,
   double default_value) const
 {
-  const auto it =
-    info_.hardware_parameters.find(name);
+  const auto it = info_.hardware_parameters.find(name);
 
   if (it == info_.hardware_parameters.end()) {
     return default_value;
@@ -1046,8 +849,7 @@ std::string Robot2System::getStringParameter(
   const std::string & name,
   const std::string & default_value) const
 {
-  const auto it =
-    info_.hardware_parameters.find(name);
+  const auto it = info_.hardware_parameters.find(name);
 
   if (it == info_.hardware_parameters.end()) {
     return default_value;
